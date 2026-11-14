@@ -1,5 +1,6 @@
 # Two API processes (replicas) sharing one Delta table volume.
-# Either replica can compact; Delta OCC serialises concurrent commits.
+# Either replica can compact or apply a correction; Delta OCC serialises
+# concurrent commits. Both expose the same Swagger UI.
 services:
   api-1:
     build: .
@@ -11,13 +12,24 @@ services:
       - "8001:8000"
     volumes:
       - delta-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   api-2:
     image: delta-compaction-api:latest
     build: .
     depends_on:
-      - api-1
+      api-1:
+        condition: service_healthy
     environment:
       DATA_ROOT: /data
       TABLE_NAME: water_level
@@ -25,6 +37,16 @@ services:
       - "8002:8000"
     volumes:
       - delta-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

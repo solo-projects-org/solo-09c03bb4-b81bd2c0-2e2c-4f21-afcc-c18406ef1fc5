@@ -10,6 +10,8 @@ Only the subset required by the water-level compaction service is implemented:
   a new log version race free, conflicts are detected by re-reading the log
 * immutable data files, unique non-reused paths, staging files outside any
   committed snapshot
+* ``compact()`` (OPTIMIZE, dataChange=false) and ``correct_observation()``
+  (point UPDATE, dataChange=true)
 
 There is deliberately no dependency on the ``delta`` / ``deltalake`` package:
 the protocol pieces used here are small enough to implement directly, which
@@ -28,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 # ---------------------------------------------------------------------------
@@ -92,6 +95,18 @@ class FileNotActiveError(DeltaError):
 
 class ConflictError(DeltaError):
     """Concurrent commit invalidated this transaction (HTTP 409)."""
+
+
+class ObservationNotFoundError(DeltaError):
+    """No observation matches the (station, utc_seconds) key (HTTP 404)."""
+
+
+class DuplicateObservationError(DeltaError):
+    """The (station, utc_seconds) key occurs more than once (HTTP 409)."""
+
+
+class OriginalValueMismatchError(DeltaError):
+    """The stored level differs from the caller's expected original (HTTP 409)."""
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +619,277 @@ def _safe_unlink(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:  # pragma: no cover - best effort cleanup
         pass
+
+
+# ---------------------------------------------------------------------------
+# Point correction (UPDATE) of a single observation
+# ---------------------------------------------------------------------------
+
+
+def _key_mask(
+    tbl: pa.Table, station: str, utc_seconds: int
+) -> pa.ChunkedArray | pa.Array:
+    """Boolean mask selecting rows with exactly (station, utc_seconds)."""
+    return pc.and_(
+        pc.equal(tbl["station"], pa.scalar(station, type=pa.string())),
+        pc.equal(tbl["utc_seconds"], pa.scalar(utc_seconds, type=pa.int64())),
+    )
+
+
+def _read_data_file(table: Path, rel: str) -> pa.Table:
+    try:
+        part = pq.read_table(_relative_data_path(table, rel))
+    except (OSError, pa.ArrowInvalid) as exc:
+        raise TableCorruptError(f"cannot read parquet {rel}: {exc}") from exc
+    if part.schema != TABLE_SCHEMA:
+        raise InvalidRequestError(f"schema of {rel} does not match the table schema")
+    if part.num_rows > 0 and _total_null_count(part) != 0:
+        raise InvalidRequestError(f"{rel} contains null values")
+    return part
+
+
+def _locate_key(
+    table: Path, snapshot: Snapshot, station: str, utc_seconds: int
+) -> list[tuple[str, int, int]]:
+    """Find every stored row for the key: ``(file, row_index, level_mm)``."""
+    matches: list[tuple[str, int, int]] = []
+    for rel in sorted(snapshot.active):
+        part = _read_data_file(table, rel)
+        indices = pc.indices_nonzero(_key_mask(part, station, utc_seconds)).to_pylist()
+        levels = part["level_mm"]
+        matches.extend((rel, int(i), int(levels[int(i)].as_py())) for i in indices)
+    return matches
+
+
+def _files_added_since(
+    snapshot: Snapshot, current: Snapshot
+) -> list[str]:
+    return sorted(set(current.active) - set(snapshot.active))
+
+
+def correct_observation(
+    table: Path,
+    *,
+    station: str,
+    utc_seconds: int,
+    original_level_mm: int,
+    corrected_level_mm: int,
+    base_version: int | None = None,
+    max_retries: int = 25,
+    fault_inject: str | None = None,
+) -> dict[str, Any]:
+    """Atomically correct exactly one water-level observation.
+
+    Semantics
+
+    * the base snapshot must contain **exactly one** row for
+      ``(station, utc_seconds)`` and its stored ``level_mm`` must equal
+      ``original_level_mm``; missing / duplicated / changed keys are rejected
+      before anything is written
+    * the file containing the row is rewritten (immutable, brand-new unique
+      path) with only that row's ``level_mm`` replaced; the rewritten file is
+      committed as a ``dataChange=true`` add and the old file is tombstoned as
+      a ``dataChange=true`` remove, so old snapshots keep reading the old
+      value and the old physical file is never deleted
+    * OCC: at commit time the source file must still be active.  If it was
+      removed by an external delete or replaced by a compaction, or if an
+      external writer appended another row for the same key, the transaction
+      aborts with :class:`ConflictError`.  Appends of unrelated rows never
+      invalidate it; only the log-version race triggers a retry.
+    * a failure before the log commit leaves the committed snapshot untouched
+      and any half-written output confined to ``_staging`` (never queryable)
+    """
+    table = Path(table)
+    if not isinstance(station, str) or not station.strip():
+        raise InvalidRequestError("station must be a non-empty string")
+    for name, value in (
+        ("utc_seconds", utc_seconds),
+        ("original_level_mm", original_level_mm),
+        ("corrected_level_mm", corrected_level_mm),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise InvalidRequestError(f"{name} must be an integer")
+        if not (-(2 ** 63) <= value <= 2 ** 63 - 1):
+            raise InvalidRequestError(f"{name} is outside the int64 range")
+
+    snapshot = load_snapshot(table, base_version)  # 404 if version missing
+    base = snapshot.version
+
+    matches = _locate_key(table, snapshot, station, utc_seconds)
+    if not matches:
+        raise ObservationNotFoundError(
+            f"no observation for station={station!r} utc_seconds={utc_seconds} "
+            f"at version {base}"
+        )
+    if len(matches) > 1:
+        raise DuplicateObservationError(
+            f"key station={station!r} utc_seconds={utc_seconds} occurs "
+            f"{len(matches)} times at version {base}; refusing to correct it"
+        )
+    source_rel, row_index, stored_level = matches[0]
+    if stored_level != original_level_mm:
+        raise OriginalValueMismatchError(
+            f"original level mismatch for station={station!r} "
+            f"utc_seconds={utc_seconds}: stored {stored_level}, "
+            f"expected {original_level_mm}"
+        )
+
+    # Rewrite only the source file; every other row (and its order) is kept
+    # verbatim.  The key was unique in the base snapshot, hence unique in this
+    # file as well.
+    source_table = _read_data_file(table, source_rel)
+    mask = _key_mask(source_table, station, utc_seconds)
+    local_indices = pc.indices_nonzero(mask).to_pylist()
+    if local_indices != [row_index]:
+        raise TableCorruptError(
+            f"inconsistent row location for {source_rel}: {local_indices}"
+        )
+    replaced = source_table.set_column(
+        2,
+        TABLE_SCHEMA.field("level_mm"),
+        pc.if_else(
+            mask,
+            pa.scalar(corrected_level_mm, type=pa.int64()),
+            source_table["level_mm"],
+        ),
+    )
+    _validate_schema(replaced)
+
+    staging_name = f"correction-{uuid.uuid4().hex}.parquet"
+    final_rel = _new_data_filename()
+    try:
+        final_rel, output_size = _write_parquet_atomic(
+            table,
+            replaced,
+            staging_name=staging_name,
+            final_rel_path=final_rel,
+        )
+    except OSError as exc:
+        (table / STAGING_DIR / staging_name).unlink(missing_ok=True)
+        raise DeltaError(f"failed to write corrected parquet: {exc}") from exc
+
+    if fault_inject == "after_data_write":
+        raise RuntimeError("fault injection: killed after data write")
+
+    attempts = 0
+    while True:
+        attempts += 1
+        current = load_snapshot(table)
+
+        # The source file must still be active: an external delete or a
+        # compaction that replaced it invalidates the planned rewrite.
+        if source_rel not in current.active:
+            _safe_unlink(table / final_rel)
+            raise ConflictError(
+                f"target file {source_rel} was removed or compacted by a "
+                "concurrent commit"
+            )
+
+        # The active log entry must still be backed by the same physical file.
+        # A vanish / in-place rewrite makes the rewritten snapshot impossible
+        # to reconcile with the immutable log, so refuse rather than commit
+        # data derived from a file that no longer matches.
+        source_abs = _relative_data_path(table, source_rel)
+        try:
+            stat = source_abs.stat()
+        except OSError as exc:
+            _safe_unlink(table / final_rel)
+            raise ConflictError(
+                f"target file {source_rel} disappeared while correcting: {exc}"
+            ) from exc
+        if (
+            not source_abs.is_file()
+            or stat.st_size != current.active[source_rel].size_bytes
+        ):
+            _safe_unlink(table / final_rel)
+            raise ConflictError(
+                f"target file {source_rel} changed on disk while correcting"
+            )
+
+        # Another writer may have appended rows for the same key while this
+        # correction was in flight; committing then would create a duplicate.
+        for rel in _files_added_since(snapshot, current):
+            part = _read_data_file(table, rel)
+            if part.num_rows and pc.any(
+                _key_mask(part, station, utc_seconds)
+            ).as_py():
+                _safe_unlink(table / final_rel)
+                raise ConflictError(
+                    f"a concurrent append added station={station!r} "
+                    f"utc_seconds={utc_seconds} in {rel}"
+                )
+
+        now = _utc_now_ms()
+        actions: list[dict[str, Any]] = [
+            {
+                "commitInfo": {
+                    "timestamp": now,
+                    "operation": "UPDATE",
+                    "operationParameters": {
+                        "predicate": (
+                            f"station = '{station}' AND "
+                            f"utc_seconds = {utc_seconds}"
+                        ),
+                    },
+                    "readVersion": base,
+                    "isBlindAppend": False,
+                    "engineInfo": "delta-compaction-api/1.0",
+                    "clientVersion": "delta-compaction-api/1.0",
+                    "metrics": {
+                        "numRemovedFiles": 1,
+                        "numAddedFiles": 1,
+                        "numUpdatedRows": 1,
+                        "numOutputBytes": output_size,
+                    },
+                }
+            },
+            {
+                "add": {
+                    "path": final_rel,
+                    "size": output_size,
+                    "modificationTime": now,
+                    "dataChange": True,
+                    "stats": json.dumps(
+                        {"numRecords": replaced.num_rows}, separators=(",", ":")
+                    ),
+                    "tags": {"correction": "true"},
+                }
+            },
+            {
+                "remove": {
+                    "path": source_rel,
+                    "deletionTimestamp": now,
+                    "dataChange": True,
+                    "size": snapshot.active[source_rel].size_bytes,
+                }
+            },
+        ]
+        try:
+            committed_version = _commit_actions(
+                table, base_version=current.version, actions=actions
+            )
+        except ConflictError:
+            if attempts > max_retries:
+                _safe_unlink(table / final_rel)
+                raise ConflictError(
+                    "too many concurrent commits, correction aborted"
+                )
+            time.sleep(0.02 * attempts)
+            continue
+
+        return {
+            "version": committed_version,
+            "base_version": base,
+            "station": station,
+            "utc_seconds": utc_seconds,
+            "original_level_mm": original_level_mm,
+            "corrected_level_mm": corrected_level_mm,
+            "source_file": source_rel,
+            "output_file": final_rel,
+            "rows": replaced.num_rows,
+            "output_bytes": output_size,
+            "attempts": attempts,
+        }
 
 
 # ---------------------------------------------------------------------------

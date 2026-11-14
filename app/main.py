@@ -57,6 +57,56 @@ class CompactResponse(BaseModel):
     attempts: int
 
 
+class CorrectRequest(BaseModel):
+    station: str = Field(
+        ...,
+        min_length=1,
+        description="Non-empty station identifier of the observation to correct.",
+    )
+    utc_seconds: int = Field(
+        ...,
+        ge=-(2**63),
+        le=2**63 - 1,
+        description="Observation timestamp as int64 UTC epoch seconds.",
+    )
+    original_level_mm: int = Field(
+        ...,
+        ge=-(2**63),
+        le=2**63 - 1,
+        description=(
+            "Level the caller believes is currently stored. The correction is "
+            "rejected unless the base snapshot holds exactly this value."
+        ),
+    )
+    corrected_level_mm: int = Field(
+        ...,
+        ge=-(2**63),
+        le=2**63 - 1,
+        description="Replacement water level in millimetres (int64).",
+    )
+    version: int | None = Field(
+        default=None,
+        ge=0,
+        description="Base snapshot version. Defaults to the latest committed version.",
+    )
+
+
+class CorrectResponse(BaseModel):
+    table: str
+    committed_version: int
+    base_version: int
+    station: str
+    utc_seconds: int
+    original_level_mm: int
+    corrected_level_mm: int
+    source_file: str
+    output_file: str
+    rows: int
+    output_bytes: int
+    data_change: bool
+    attempts: int
+
+
 class SnapshotResponse(BaseModel):
     table: str
     version: int
@@ -100,17 +150,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Delta Lake Compaction API",
+    title="Delta Lake Water-Level API",
     description=(
-        "Compact small parquet files of the unpartitioned water-level "
-        "observation Delta table (reader protocol v1, writer protocol v2, "
-        "no deletion vectors). Compaction commits use add/remove actions "
-        "with dataChange=false and preserve every value, duplicate row, "
-        "the schema and all old snapshots. Optimistic concurrency control "
-        "lets external writers keep committing; the compaction only "
-        "replaces its selected files while all of them are still active."
+        "Compact small parquet files and correct single observations of the "
+        "unpartitioned water-level Delta table (reader protocol v1, writer "
+        "protocol v2, no deletion vectors).\n\n"
+        "* **POST /compact** merges >= 2 active files. Commits use add/remove "
+        "actions with `dataChange=false` and preserve every value, duplicate "
+        "row, the schema and all old snapshots.\n"
+        "* **POST /correct** atomically replaces the `level_mm` of exactly one "
+        "row identified by `(station, utc_seconds)`. The base snapshot must "
+        "hold exactly one row for the key and its stored value must equal "
+        "`original_level_mm`; otherwise the request is rejected. The corrected "
+        "row is written to a new immutable parquet file and committed with "
+        "`dataChange=true` (the old file is tombstoned, never deleted), so "
+        "older snapshots keep reading the original value.\n\n"
+        "Optimistic concurrency control lets external writers keep committing. "
+        "A transaction is committed only while all files it depends on are "
+        "still active; a concurrent delete or compaction of the target file, "
+        "or a concurrent append of the same observation key, is reported as "
+        "409. Unrelated appends never block it."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -120,8 +181,11 @@ def _delta_http(exc: delta.DeltaError) -> HTTPException:
         delta.TableNotFoundError: 404,
         delta.VersionNotFoundError: 404,
         delta.FileNotActiveError: 404,
+        delta.ObservationNotFoundError: 404,
         delta.InvalidRequestError: 400,
         delta.ConflictError: 409,
+        delta.DuplicateObservationError: 409,
+        delta.OriginalValueMismatchError: 409,
         delta.TableCorruptError: 500,
     }
     for cls, code in status.items():
@@ -162,6 +226,43 @@ def compact(req: CompactRequest) -> CompactResponse:
         rows=result["rows"],
         input_bytes=result["input_bytes"],
         output_bytes=result["output_bytes"],
+        attempts=result["attempts"],
+    )
+
+
+@app.post("/correct", response_model=CorrectResponse, tags=["corrections"])
+def correct(req: CorrectRequest) -> CorrectResponse:
+    """Correct one observation identified by (station, utc_seconds).
+
+    The base snapshot must contain exactly one row for the key and its stored
+    level must equal ``original_level_mm``. The corrected row is written to a
+    new immutable parquet file and committed with ``dataChange=true``; the old
+    file is tombstoned (not deleted) so older snapshots keep the old value.
+    """
+    try:
+        result = delta.correct_observation(
+            TABLE_DIR,
+            station=req.station,
+            utc_seconds=req.utc_seconds,
+            original_level_mm=req.original_level_mm,
+            corrected_level_mm=req.corrected_level_mm,
+            base_version=req.version,
+        )
+    except delta.DeltaError as exc:
+        raise _delta_http(exc)
+    return CorrectResponse(
+        table=TABLE_NAME,
+        committed_version=result["version"],
+        base_version=result["base_version"],
+        station=result["station"],
+        utc_seconds=result["utc_seconds"],
+        original_level_mm=result["original_level_mm"],
+        corrected_level_mm=result["corrected_level_mm"],
+        source_file=result["source_file"],
+        output_file=result["output_file"],
+        rows=result["rows"],
+        output_bytes=result["output_bytes"],
+        data_change=True,
         attempts=result["attempts"],
     )
 

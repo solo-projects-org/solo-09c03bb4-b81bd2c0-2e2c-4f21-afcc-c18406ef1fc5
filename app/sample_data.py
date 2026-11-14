@@ -7,10 +7,9 @@ initialisation itself commits via the same atomic log primitive.
 
 from __future__ import annotations
 
+import fcntl
 import os
 from pathlib import Path
-
-import pyarrow as pa
 
 from app.delta import init_table, load_snapshot
 from .external_writer import append_rows
@@ -30,12 +29,26 @@ def _batch(station: str, start: int, levels: list[int], t0: int) -> list[dict]:
 def create_sample_table(table: Path) -> dict:
     """Create the demo table (if absent) with 4 small files across 2 versions.
 
-    Concurrent calls (e.g. two API replicas starting together) converge: a
-    writer that loses a commit race re-reads the table and stops appending as
-    soon as another writer has populated it.
+    Concurrent calls (e.g. two API replicas starting together) converge: the
+    bootstrap itself is serialised through an advisory lock on the staging
+    directory, so two processes can never both observe an empty table and
+    each append a full sample set.
     """
     table = Path(table)
     init_table(table)
+    # flock is per open file description, so it works across processes and
+    # threads; released automatically if the holder dies.  The lock lives at
+    # the table root (dotfile, never a data path) so _staging stays free of
+    # non-parquet files.
+    with (table / ".bootstrap.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return _populate_sample_table(table)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _populate_sample_table(table: Path) -> dict:
     snap = load_snapshot(table)
     if snap.active:
         return {"table": str(table), "created": False, "version": snap.version}
@@ -50,10 +63,6 @@ def create_sample_table(table: Path) -> dict:
     expected_files = len(batches)
     append_versions: list[int] = []
     for batch in batches:
-        # If another replica is populating the table in parallel, stop as soon
-        # as the complete sample exists; otherwise keep writing our share.
-        if len(load_snapshot(table).active) >= expected_files:
-            break
         append_versions.append(append_rows(table, batch)["version"])
     snap = load_snapshot(table)
     return {
